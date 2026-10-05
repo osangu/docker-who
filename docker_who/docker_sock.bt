@@ -1,0 +1,53 @@
+// Who asks dockerd to do what. Loaded by docker_observer.py, which replaces
+//   @@SOCKET_MATCH@@  a strncmp($path, ...) test per docker socket path
+//   @@CLOSE_FD@@      the kernel function behind close(2) on this kernel
+//                     (file_close_fd 6.7+, close_fd 5.11+, __close_fd before)
+//
+// Tracks fds that connected to the docker socket (bitmask per process, fds < 64)
+// and prints writes on them that start with "POST /" — one line per HTTP request:
+//   pid \t uid \t loginuid \t comm \t <first bytes of the request>
+// Anything else on those fds (e.g. keystrokes of `docker exec -it`) is not read.
+// loginuid comes from the kernel task, so it survives sudo and short-lived CLIs.
+//
+// fentry/fexit, not syscall tracepoints: attaching a tracepoint goes through
+// perf_event_open, which Ubuntu's perf_event_paranoid=4 denies without
+// CAP_SYS_ADMIN on older kernels (5.15). BPF trampolines need only BPF + PERFMON.
+// Kernel BTF does not mark these arguments as user pointers, hence uptr().
+
+fexit:vmlinux:__sys_connect
+/args.fd >= 0 && args.fd < 64/
+{
+  $sa = (struct sockaddr_un *)uptr(args.uservaddr);
+  $path = $sa->sun_path;
+  if ($sa->sun_family == 1 && (@@SOCKET_MATCH@@) && (retval == 0 || retval == -115)) {
+    // -115 = EINPROGRESS (non-blocking connect)
+    @dfd[pid] = @dfd[pid] | (1 << args.fd);
+  } else if (@dfd[pid]) {
+    @dfd[pid] = @dfd[pid] & ~(1 << args.fd);
+  }
+}
+
+fentry:vmlinux:@@CLOSE_FD@@
+/@dfd[pid] && args.fd < 64/
+{
+  @dfd[pid] = @dfd[pid] & ~(1 << args.fd);
+}
+
+fentry:vmlinux:do_exit
+/@dfd[pid] && pid == tid/
+{
+  delete(@dfd[pid]);
+}
+
+fentry:vmlinux:ksys_write
+/args.fd < 64 && ((@dfd[pid] >> args.fd) & 1)/
+{
+  if (strncmp(str(uptr(args.buf), 7), "POST /", 6) == 0) {
+    printf("%u\t%u\t%u\t%s\t%s\n", pid, uid, curtask->loginuid.val, comm, str(uptr(args.buf), 160));
+  }
+}
+
+END
+{
+  clear(@dfd);
+}
